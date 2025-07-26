@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Routing Algorithm Simulator</title>
+  <title>Routing Algorithm Race</title>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.3/dist/leaflet.css" />
@@ -45,10 +45,10 @@
       box-shadow: 0 0 15px rgba(0,0,0,0.2);
     }
     #blocking-toggle:checked + label {
-      background-color: #4ade80; /* Green when active */
+      background-color: #4ade80;
     }
     #blocking-toggle:not(:checked) + label {
-      background-color: #f87171; /* Red when inactive */
+      background-color: #f87171;
     }
     #blocking-toggle:not(:checked) + label span {
       transform: translateX(0);
@@ -56,10 +56,29 @@
     .road-line.blocked {
       stroke-dasharray: 10, 10;
     }
+    .race-marker {
+      z-index: 200;
+      filter: drop-shadow(0 0 5px rgba(0,0,0,0.7));
+    }
+    .race-progress {
+      height: 20px;
+      background-color: #e5e7eb;
+      border-radius: 4px;
+      margin-top: 8px;
+    }
+    .race-progress-bar {
+      height: 100%;
+      border-radius: 4px;
+      transition: width 0.3s ease;
+    }
+    .race-position {
+      font-weight: bold;
+      font-size: 1.1em;
+    }
   </style>
 </head>
 <body class="flex flex-col h-screen p-5 m-0 font-sans">
-  <h1 class="text-2xl font-bold text-gray-800 mb-4">Routing Algorithm Simulator</h1>
+  <h1 class="text-2xl font-bold text-gray-800 mb-4">Pathfinding Algorithm Race</h1>
 
   <div class="input-container mb-5 flex-shrink-0 flex items-center gap-4">
     <!-- Start Node -->
@@ -90,10 +109,10 @@
       </span>
     </div>
     
-    <!-- Run Simulation Button -->
-    <button onclick="runSimulation()" 
-            class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 whitespace-nowrap">
-      Run Simulation
+    <!-- Start Race Button -->
+    <button onclick="startRace()" 
+            class="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 whitespace-nowrap">
+      Start Race
     </button>
 
     <!-- Reset Button -->
@@ -108,9 +127,17 @@
     </div>
 
     <div id="results-container" class="w-1/3 border border-gray-300 rounded-lg bg-gray-50 shadow-sm flex flex-col">
-      <h3 class="text-lg font-semibold text-gray-800 p-4 border-b border-gray-300">Routing Results</h3>
+      <div id="race-status" class="p-4 border-b border-gray-300 bg-blue-50">
+        <div class="flex justify-between items-center">
+          <span class="font-medium">Race Status:</span>
+          <span id="race-state" class="px-2 py-1 bg-gray-200 rounded text-sm">Not Started</span>
+        </div>
+      </div>
       <div id="results" class="flex-1 overflow-auto p-4">
-        <!-- Results will be inserted here -->
+        <!-- Race progress will be inserted here -->
+        <div class="text-center text-gray-500 my-10">
+          Set your blocked roads and click "Start Race" to begin
+        </div>
       </div>
     </div>
   </div>
@@ -125,6 +152,9 @@
   let blockedEdges = new Set();
   const MAX_BLOCKED = 10;
   let isBlockingMode = true;
+  let raceMarkers = {};
+  let raceInterval;
+  let raceState = 'not_started';
   
   // Updated color scheme
   const algorithmColors = {
@@ -152,6 +182,7 @@
         div.innerHTML += 
           `<i style="background:${algorithmColors[algo]}"></i>${algo} Path<br>`;
       }
+      div.innerHTML += '<i style="background:#000000"></i>Current Position<br>';
       return div;
     };
     legend.addTo(map);
@@ -212,6 +243,15 @@
     pathLayers = {};
     if (startMarker) map.removeLayer(startMarker);
     if (endMarker) map.removeLayer(endMarker);
+    clearRaceMarkers();
+  }
+
+  // Clear race markers from map
+  function clearRaceMarkers() {
+    for (const algo in raceMarkers) {
+      map.removeLayer(raceMarkers[algo]);
+    }
+    raceMarkers = {};
   }
 
   // Clear road data from map
@@ -337,7 +377,28 @@
     document.getElementById('blocked-count').textContent = blockedEdges.size;
   }
 
-  async function runSimulation() {
+  function updateRaceState(state) {
+    raceState = state;
+    const stateElement = document.getElementById('race-state');
+    stateElement.textContent = state.replace('_', ' ');
+    stateElement.className = 'px-2 py-1 rounded text-sm ';
+    
+    switch(state) {
+      case 'not_started':
+        stateElement.className += 'bg-gray-200';
+        break;
+      case 'in_progress':
+        stateElement.className += 'bg-yellow-200';
+        break;
+      case 'finished':
+        stateElement.className += 'bg-green-200';
+        break;
+      default:
+        stateElement.className += 'bg-gray-200';
+    }
+  }
+
+  async function startRace() {
     const startNodeInput = document.getElementById("start_node").value.trim();
     const endNodeInput = document.getElementById("end_node").value.trim();
     const resultsDiv = document.getElementById("results");
@@ -365,7 +426,6 @@
         }
     }).filter(edge => edge !== null);
 
-
     // Prepare request data in exact format
     const requestData = {
       start_node: startNode,
@@ -373,17 +433,13 @@
       blocked_edges: blockedEdgesArray
     };
 
-      // Debug: Log the formatted blocked edges
-    console.log("Formatted blocked_edges:", JSON.stringify(blockedEdgesArray, null, 2));
-
-    console.log("Sending to server:", JSON.stringify(requestData, null, 2));
-
     resultsDiv.innerHTML = `
       <div class="h-full flex items-center justify-center text-gray-500">
         <div class="animate-spin rounded-full h-5 w-5 border-t-2 border-b-2 border-blue-500 mr-2"></div>
-        <span>Calculating routes...</span>
+        <span>Calculating race paths...</span>
       </div>`;
     clearPaths();
+    updateRaceState('in_progress');
 
     try {
       const response = await fetch("/run_simulation", {
@@ -427,70 +483,90 @@
         ], {padding: [50, 50]});
       }
 
-      // Update results table
-      let table = `
-        <table class="w-full text-sm mb-4">
-          <thead>
-            <tr class="bg-blue-800 text-white">
-              <th class="px-3 py-2 text-left font-semibold">Algorithm</th>
-              <th class="px-3 py-2 text-left font-semibold">Cost</th>
-              <th class="px-3 py-2 text-left font-semibold">Time (s)</th>
-              <th class="px-3 py-2 text-center font-semibold">Nodes</th>
-              <th class="px-3 py-2 text-left font-semibold">Status</th>
-            </tr>
-          </thead>
-          <tbody>`;
-
       // Process each algorithm's result
-      for (const result of data.results) {
-        const statusIcon = result.path_found ? 
-          '<span class="mr-1">✅</span>' : 
-          '<span class="mr-1">❌</span>';
-        const statusText = result.path_found ? 'Found' : 'Not Found';
-        const statusClass = result.path_found ? 'text-green-600 font-semibold' : 'text-red-600 font-semibold';
-        
-        table += `
-          <tr class="hover:bg-blue-50 even:bg-gray-100">
-            <td class="px-3 py-2 font-semibold text-gray-800">${result.algorithm}</td>
-            <td class="px-3 py-2 font-mono font-semibold">${result.cost !== -1 ? result.cost.toFixed(2) : 'N/A'}</td>
-            <td class="px-3 py-2 font-mono text-gray-500">${result.execution_time !== -1 ? result.execution_time.toFixed(4) : 'N/A'}</td>
-            <td class="px-3 py-2 text-center">${result.path_length}</td>
-            <td class="px-3 py-2 ${statusClass}">
-              ${statusIcon}${statusText}
-            </td>
-          </tr>`;
+      const raceData = {};
+      let maxPathLength = 0;
 
-        // Add path to map if found
+      // Initialize all algorithms, even if they didn't find a path
+      const allAlgorithms = ['Dijkstra', 'A*', 'Greedy BFS', 'Ant Colony'];
+      allAlgorithms.forEach(algo => {
+        const result = data.results.find(r => r.algorithm === algo) || {
+          algorithm: algo,
+          path_found: false,
+          path: [],
+          execution_time: 0,
+          cost: -1,
+          path_length: 0
+        };
+
         if (result.path_found && result.path) {
           const latLngs = pathToLatLngs(result.path);
           if (latLngs.length > 1) {
+            raceData[algo] = {
+              path: latLngs,
+              color: algorithmColors[algo],
+              currentIndex: 0,
+              finished: false,
+              finishTime: result.execution_time,
+              cost: result.cost,
+              pathLength: result.path_length
+            };
+            maxPathLength = Math.max(maxPathLength, result.path_length);
+            
+            // Add path to map
             const pathLayer = L.polyline(latLngs, {
-              color: algorithmColors[result.algorithm],
+              color: algorithmColors[algo],
               weight: 4,
               opacity: 0.7,
-              dashArray: result.algorithm === 'Ant Colony' ? '5, 5' : null,
+              dashArray: algo === 'Ant Colony' ? '5, 5' : null,
               className: 'path-line'
-            }).addTo(map).bindPopup(`${result.algorithm} Path`);
+            }).addTo(map).bindPopup(`${algo} Path`);
             
-            pathLayers[result.algorithm] = pathLayer;
+            pathLayers[algo] = pathLayer;
           }
+        } else {
+          // For algorithms that didn't find a path
+          raceData[algo] = {
+            path: [],
+            color: algorithmColors[algo],
+            currentIndex: 0,
+            finished: true, // Mark as finished immediately
+            finishTime: 0,
+            cost: -1,
+            pathLength: 0
+          };
         }
-      }
+      });
 
-      table += "</tbody></table>";
+      // Create race progress UI
+      let raceUI = '<div class="space-y-4">';
+      
+      allAlgorithms.forEach(algo => {
+        const data = raceData[algo];
+        raceUI += `
+          <div class="race-algorithm" data-algo="${algo}">
+            <div class="flex justify-between items-center">
+              <div class="flex items-center">
+                <div class="w-3 h-3 rounded-full mr-2" style="background-color: ${algorithmColors[algo]}"></div>
+                <span class="font-semibold">${algo}</span>
+              </div>
+              <div class="race-position">${data.finished ? 'DNF' : '1st'}</div>
+            </div>
+            <div class="race-progress">
+              <div class="race-progress-bar" style="width: ${data.finished ? 0 : 0}%; background-color: ${algorithmColors[algo]}"></div>
+            </div>
+            <div class="text-xs text-gray-500 mt-1">
+              <span class="distance">${data.finished ? '0' : '0'}/${data.pathLength} nodes</span>
+              <span class="speed float-right">0.00 nodes/s</span>
+            </div>
+          </div>`;
+      });
+      
+      raceUI += '</div>';
+      resultsDiv.innerHTML = raceUI;
 
-      // Add blocked roads list
-      let blockedRoadsList = '<div class="w-full text-sm"><h4 class="font-semibold text-gray-800 mb-2">Blocked Roads:</h4>';
-      if (blockedEdges.size > 0) {
-        blockedEdgesArray.forEach(road => {
-          blockedRoadsList += `<div class="text-sm text-red-600 py-1">${road.start_node} → ${road.end_node}</div>`;
-        });
-      } else {
-        blockedRoadsList += '<div class="text-sm text-gray-500 py-1">No roads currently blocked</div>';
-      }
-      blockedRoadsList += '</div>';
-
-      resultsDiv.innerHTML = table + blockedRoadsList;
+      // Start the race animation
+      startRaceAnimation(raceData);
 
     } catch (error) {
       resultsDiv.innerHTML = `
@@ -498,11 +574,240 @@
           Error: ${error.message}
           <br>Please check your inputs and try again.
         </p>`;
-      console.error("Simulation error:", error);
+      console.error("Race error:", error);
+      updateRaceState('not_started');
     }
   }
 
+  function startRaceAnimation(raceData) {
+    // Clear any existing interval
+    if (raceInterval) clearInterval(raceInterval);
+    
+    // Clear existing markers
+    clearRaceMarkers();
+    
+    // Create markers for each algorithm
+    const algorithms = Object.keys(raceData);
+    algorithms.forEach(algo => {
+      if (raceData[algo].path.length > 0) {
+        const firstPoint = raceData[algo].path[0];
+        raceMarkers[algo] = L.marker(firstPoint, {
+          icon: L.divIcon({
+            className: 'race-marker',
+            html: `<div style="background-color: ${raceData[algo].color}; width: 16px; height: 16px; border-radius: 50%; border: 2px solid white;"></div>`,
+            iconSize: [20, 20]
+          })
+        }).addTo(map).bindPopup(`${algo} Current Position`);
+      }
+    });
+    
+    let startTime = Date.now();
+    let positions = algorithms.map(() => 0);
+    let finishedCount = 0;
+    
+    raceInterval = setInterval(() => {
+      const currentTime = Date.now() - startTime;
+      let allFinished = true;
+      let maxProgress = 0;
+      
+      algorithms.forEach((algo, index) => {
+        const data = raceData[algo];
+        if (data.finished) {
+          positions[index] = data.path.length;
+          return;
+        }
+        
+        allFinished = false;
+        
+        // Calculate progress based on time (simulating speed)
+        const targetProgress = Math.min(1, currentTime / (data.finishTime * 1000));
+        const targetIndex = Math.floor(targetProgress * (data.path.length - 1));
+        
+        if (targetIndex > data.currentIndex) {
+          data.currentIndex = targetIndex;
+          const currentPoint = data.path[targetIndex];
+          
+          // Update marker position
+          if (raceMarkers[algo]) {
+            raceMarkers[algo].setLatLng(currentPoint);
+          }
+          
+          // Update progress bar
+          const progressPercent = (targetIndex / (data.path.length - 1)) * 100;
+          const algoElement = document.querySelector(`.race-algorithm[data-algo="${algo}"]`);
+          if (algoElement) {
+            algoElement.querySelector('.race-progress-bar').style.width = `${progressPercent}%`;
+            algoElement.querySelector('.distance').textContent = `${targetIndex}/${data.path.length} nodes`;
+            
+            // Calculate speed (nodes per second)
+            const speed = targetIndex / (currentTime / 1000);
+            algoElement.querySelector('.speed').textContent = `${speed.toFixed(2)} nodes/s`;
+          }
+          
+          positions[index] = targetIndex;
+          
+          // Check if finished
+          if (targetIndex >= data.path.length - 1) {
+            data.finished = true;
+            finishedCount++;
+            
+            // Flash the marker when finished
+            if (raceMarkers[algo]) {
+              raceMarkers[algo].setIcon(L.divIcon({
+                className: 'race-marker',
+                html: `<div style="background-color: ${data.color}; width: 16px; height: 16px; border-radius: 50%; border: 2px solid white; box-shadow: 0 0 0 4px ${data.color}44;"></div>`,
+                iconSize: [20, 20]
+              }));
+            }
+          }
+        }
+        
+        maxProgress = Math.max(maxProgress, targetIndex);
+      });
+      
+      // Update positions for all algorithms
+      if (!allFinished) {
+        // Sort algorithms by progress (descending)
+        const sortedIndices = [...Array(algorithms.length).keys()].sort((a, b) => positions[b] - positions[a]);
+        
+        sortedIndices.forEach((originalIndex, sortedIndex) => {
+          const algo = algorithms[originalIndex];
+          let positionText;
+          
+          if (sortedIndex === 0 && raceData[algo].finished) {
+            positionText = '🥇 Winner!';
+          } else if (sortedIndex === 1 && raceData[algo].finished) {
+            positionText = '🥈 2nd';
+          } else if (sortedIndex === 2 && raceData[algo].finished) {
+            positionText = '🥉 3rd';
+          } else if (sortedIndex === 3 && raceData[algo].finished) {
+            positionText = '4️⃣ 4th';
+          } else {
+            positionText = `${sortedIndex + 1}${getOrdinalSuffix(sortedIndex + 1)}`;
+          }
+          
+          const algoElement = document.querySelector(`.race-algorithm[data-algo="${algo}"]`);
+          if (algoElement) {
+            const positionElement = algoElement.querySelector('.race-position');
+            positionElement.textContent = positionText;
+            
+            // Color the positions
+            if (sortedIndex === 0) {
+              positionElement.className = 'race-position text-yellow-600';
+            } else if (sortedIndex === 1) {
+              positionElement.className = 'race-position text-gray-400';
+            } else if (sortedIndex === 2) {
+              positionElement.className = 'race-position text-amber-600';
+            } else {
+              positionElement.className = 'race-position';
+            }
+          }
+        });
+      }
+      
+      if (allFinished) {
+        clearInterval(raceInterval);
+        updateRaceState('finished');
+        
+        // Show final results table
+        showFinalResults(raceData);
+      }
+    }, 50); // Update every 50ms for smooth animation
+  }
+
+  function getOrdinalSuffix(num) {
+    const j = num % 10, k = num % 100;
+    if (j === 1 && k !== 11) return 'st';
+    if (j === 2 && k !== 12) return 'nd';
+    if (j === 3 && k !== 13) return 'rd';
+    return 'th';
+  }
+
+  function showFinalResults(raceData) {
+    const resultsDiv = document.getElementById("results");
+    let table = `
+      <div class="mb-4">
+        <h4 class="font-semibold text-lg mb-2">Final Results</h4>
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="bg-blue-800 text-white">
+              <th class="px-3 py-2 text-left">Position</th>
+              <th class="px-3 py-2 text-left">Algorithm</th>
+              <th class="px-3 py-2 text-left">Time</th>
+              <th class="px-3 py-2 text-left">Cost</th>
+              <th class="px-3 py-2 text-left">Nodes</th>
+            </tr>
+          </thead>
+          <tbody>`;
+    
+    // Sort algorithms by finish time
+    const sortedAlgorithms = Object.keys(raceData).sort((a, b) => {
+      return raceData[a].finishTime - raceData[b].finishTime;
+    });
+    
+    // Medal emojis for top 4
+    const medals = ['🥇', '🥈', '🥉', '4️⃣'];
+    
+    sortedAlgorithms.forEach((algo, index) => {
+      const data = raceData[algo];
+      const position = index + 1;
+      const medal = position <= 4 ? medals[position - 1] : `${position}${getOrdinalSuffix(position)}`;
+      
+      table += `
+        <tr class="hover:bg-blue-50 even:bg-gray-100">
+          <td class="px-3 py-2 font-semibold">${medal}</td>
+          <td class="px-3 py-2 font-semibold" style="color: ${data.color}">${algo}</td>
+          <td class="px-3 py-2 font-mono">${data.finishTime > 0 ? data.finishTime.toFixed(4) + 's' : 'DNF'}</td>
+          <td class="px-3 py-2 font-mono">${data.cost > 0 ? data.cost.toFixed(2) : 'N/A'}</td>
+          <td class="px-3 py-2">${data.pathLength}</td>
+        </tr>`;
+    });
+    
+    // Ensure all 4 algorithms are shown even if some didn't finish
+    const allAlgorithms = ['Dijkstra', 'A*', 'Greedy BFS', 'Ant Colony'];
+    const missingAlgorithms = allAlgorithms.filter(algo => !sortedAlgorithms.includes(algo));
+    
+    missingAlgorithms.forEach((algo, index) => {
+      const position = sortedAlgorithms.length + index + 1;
+      table += `
+        <tr class="hover:bg-blue-50 even:bg-gray-100">
+          <td class="px-3 py-2 font-semibold">${position}${getOrdinalSuffix(position)}</td>
+          <td class="px-3 py-2 font-semibold" style="color: ${algorithmColors[algo]}">${algo}</td>
+          <td class="px-3 py-2 font-mono text-gray-400">DNF</td>
+          <td class="px-3 py-2 font-mono text-gray-400">N/A</td>
+          <td class="px-3 py-2 text-gray-400">0</td>
+        </tr>`;
+    });
+    
+    table += `
+          </tbody>
+        </table>
+      </div>`;
+    
+    // Add blocked roads list
+    let blockedRoadsList = '<div class="w-full text-sm"><h4 class="font-semibold text-gray-800 mb-2">Blocked Roads:</h4>';
+    if (blockedEdges.size > 0) {
+      Array.from(blockedEdges).forEach(edge => {
+        try {
+          const road = JSON.parse(edge);
+          blockedRoadsList += `<div class="text-sm text-red-600 py-1">${road.start_node} → ${road.end_node}</div>`;
+        } catch (e) {
+          console.error("Error parsing edge:", edge);
+        }
+      });
+    } else {
+      blockedRoadsList += '<div class="text-sm text-gray-500 py-1">No roads were blocked</div>';
+    }
+    blockedRoadsList += '</div>';
+    
+    resultsDiv.innerHTML = table + blockedRoadsList;
+  }
+
   function resetAll() {
+    // Clear any running race
+    if (raceInterval) clearInterval(raceInterval);
+    updateRaceState('not_started');
+    
     // Clear blocked edges
     blockedEdges.clear();
     updateBlockedCount();
@@ -520,7 +825,10 @@
     clearPaths();
     
     // Clear results display
-    document.getElementById('results').innerHTML = '';
+    document.getElementById('results').innerHTML = `
+      <div class="text-center text-gray-500 my-10">
+        Set your blocked roads and click "Start Race" to begin
+      </div>`;
     
     // Reset blocking mode toggle
     document.getElementById('blocking-toggle').checked = true;
