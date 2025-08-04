@@ -8,6 +8,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import mean_squared_error
 import time
+import heapq
 from math import radians, cos, sin, asin, sqrt
 import os
 
@@ -15,23 +16,27 @@ app = Flask(__name__)
 CORS(app)
 
 # ====================== Data Loading and Preparation ======================
-def load_and_prepare_data(filepath, split_data=False, test_size=0.2, random_state=42):
+def load_and_prepare_data(filepath, split_data=False, test_size=0.3, random_state=42):
     try:
         df = pd.read_csv(filepath)
         if df.empty:
             raise ValueError("CSV file is empty")
-        df = df.drop(columns=['paths', 'route'], errors='ignore')
-        if 'is_blocked' not in df.columns:
-            df['is_blocked'] = 0
-        df['cost'] = df['duration_seconds'] + df['distance_meters'] + (df['is_blocked'] * 1000)
+        # Keep only needed columns
+        df = df[['start_node', 'end_node', 'speed_limit_kph', 'distance_meters', 
+                'duration_seconds', 'is_signed', 'is_blocked']]
+        
+        # Convert is_blocked to int if it's not already
+        df['is_blocked'] = df['is_blocked'].astype(int)
+        
+        # Calculate cost - adjust weights as needed
+        df['cost'] = df['duration_seconds'] + df['distance_meters'] * 0.1 + (df['is_blocked'] * 1000)
         
         if split_data:
-            # Split the data into training and test sets
             train_df, test_df = train_test_split(
                 df, 
                 test_size=test_size, 
                 random_state=random_state,
-                stratify=df['is_blocked']  # Maintain same proportion of blocked roads
+                stratify=df['is_blocked']
             )
             return train_df, test_df
         return df
@@ -119,54 +124,56 @@ cost_predictor = RoadCostPredictor()
 
 # ====================== Graph Construction ======================
 def build_graph(df, use_predicted_costs=False):
-    is_directed = 'oneway' in df.columns and any(df['oneway'].str.lower() == 'oneway')
+    """Optimized graph building function"""
+    # Determine if graph should be directed
+    is_directed = 'is_signed' in df.columns and any(df['is_signed'].str.lower() == 'oneway')
     G = nx.DiGraph() if is_directed else nx.Graph()
-
-    for _, row in df.iterrows():
-        # Use predicted cost if enabled and model is trained
-        if use_predicted_costs and cost_predictor.is_trained:
-            weight = cost_predictor.predict_cost(
+    
+    # Pre-compute predicted costs if needed
+    if use_predicted_costs and cost_predictor.is_trained:
+        predicted_costs = {}
+        for _, row in df.iterrows():
+            key = (row['start_node'], row['end_node'])
+            predicted_costs[key] = cost_predictor.predict_cost(
                 row['start_node'],
                 row['end_node'],
                 row['distance_meters'],
                 row['speed_limit_kph'],
                 row['is_blocked']
             )
+    
+    # Build edges
+    for _, row in df.iterrows():
+        start = row['start_node']
+        end = row['end_node']
+        is_blocked = bool(row['is_blocked'])
+        
+        if use_predicted_costs and cost_predictor.is_trained:
+            weight = predicted_costs[(start, end)]
         else:
-            weight = float('inf') if row['is_blocked'] else row['cost']
-            
-        G.add_edge(
-            row['start_node'],
-            row['end_node'],
-            weight=weight,
-            distance=row['distance_meters'],
-            duration=row['duration_seconds'],
-            is_blocked=bool(row['is_blocked']),
-            speed_limit=row['speed_limit_kph'],
-            original_weight=row['cost']
-        )
-
-        # Add reverse edge for undirected graphs if not blocked
-        if not is_directed and not row['is_blocked']:
+            weight = float('inf') if is_blocked else row['cost']
+        
+        # Add edge with all attributes
+        edge_data = {
+            'weight': weight,
+            'distance': row['distance_meters'],
+            'duration': row['duration_seconds'],
+            'is_blocked': is_blocked,
+            'speed_limit': row['speed_limit_kph'],
+            'original_weight': row['cost'],
+            'is_oneway': (row['is_signed'].lower() == 'oneway')
+        }
+        
+        G.add_edge(start, end, **edge_data)
+        
+        # Add reverse edge if needed
+        if (not is_directed or row['is_signed'].lower() == 'twoway') and not is_blocked:
             if use_predicted_costs and cost_predictor.is_trained:
-                weight = cost_predictor.predict_cost(
-                    row['end_node'],
-                    row['start_node'],
-                    row['distance_meters'],
-                    row['speed_limit_kph'],
-                    row['is_blocked']
-                )
+                weight = predicted_costs[(end, start)] if (end, start) in predicted_costs else edge_data['original_weight']
             
-            G.add_edge(
-                row['end_node'],
-                row['start_node'],
-                weight=weight,
-                distance=row['distance_meters'],
-                duration=row['duration_seconds'],
-                is_blocked=bool(row['is_blocked']),
-                speed_limit=row['speed_limit_kph'],
-                original_weight=row['cost']
-            )
+            G.add_edge(end, start, **edge_data)
+            G.edges[end, start]['is_oneway'] = False
+    
     return G
 
 # ====================== Heuristic Function ======================
@@ -181,60 +188,217 @@ def heuristic(u, v):
 
 # ====================== Pathfinding Algorithms ======================
 def run_dijkstra(G, start, end):
-    """Dijkstra's algorithm implementation that respects blocked edges"""
+    """Optimized Dijkstra's algorithm with early termination and priority queue improvements"""
     start_time = time.perf_counter()
+    
+    if start == end:
+        return [start], 0, time.perf_counter() - start_time
+    
     try:
-        # Create a temporary graph where blocked edges have infinite weight
-        temp_G = nx.DiGraph() if isinstance(G, nx.DiGraph) else nx.Graph()
-        for u, v, d in G.edges(data=True):
-            weight = float('inf') if d.get('is_blocked', False) else d['weight']
-            temp_G.add_edge(u, v, weight=weight)
-
-        path = nx.shortest_path(temp_G, source=start, target=end, weight='weight')
-        cost = nx.shortest_path_length(temp_G, source=start, target=end, weight='weight')
-        exec_time = time.perf_counter() - start_time
-        return path, cost, exec_time
-    except:
+        # Create a priority queue using heapq
+        heap = []
+        heapq.heappush(heap, (0, start))
+        
+        # Keep track of visited nodes and their costs
+        visited = {start: 0}
+        # Keep track of the path
+        path = {start: [start]}
+        
+        while heap:
+            current_cost, current_node = heapq.heappop(heap)
+            
+            # Early termination if we've reached the end
+            if current_node == end:
+                exec_time = time.perf_counter() - start_time
+                return path[current_node], current_cost, exec_time
+            
+            # Skip if we've found a better path already
+            if current_cost > visited.get(current_node, float('inf')):
+                continue
+                
+            for neighbor, edge_data in G[current_node].items():
+                if edge_data.get('is_blocked', False):
+                    continue
+                    
+                new_cost = current_cost + edge_data['weight']
+                
+                # Only proceed if this path is better than any existing one
+                if neighbor not in visited or new_cost < visited[neighbor]:
+                    visited[neighbor] = new_cost
+                    path[neighbor] = path[current_node] + [neighbor]
+                    heapq.heappush(heap, (new_cost, neighbor))
+        
+        # If we get here, no path was found
+        return None, float('inf'), time.perf_counter() - start_time
+        
+    except Exception as e:
+        app.logger.error(f"Dijkstra error: {str(e)}")
         return None, float('inf'), time.perf_counter() - start_time
 
 def run_astar(G, start, end):
-    """A* algorithm implementation that respects blocked edges"""
+    """Optimized A* algorithm with efficient heuristics and priority queue"""
     start_time = time.perf_counter()
+    
+    if start == end:
+        return [start], 0, time.perf_counter() - start_time
+    
     try:
-        # Create a temporary graph where blocked edges have infinite weight
-        temp_G = nx.DiGraph() if isinstance(G, nx.DiGraph) else nx.Graph()
-        for u, v, d in G.edges(data=True):
-            weight = float('inf') if d.get('is_blocked', False) else d['weight']
-            temp_G.add_edge(u, v, weight=weight)
-
-        path = nx.astar_path(temp_G, source=start, target=end, heuristic=heuristic, weight='weight')
-        cost = sum(temp_G[u][v]['weight'] for u, v in zip(path[:-1], path[1:]))
-        exec_time = time.perf_counter() - start_time
-        return path, cost, exec_time
-    except:
+        # Pre-compute heuristic for end node if possible
+        try:
+            end_coords = eval(end)
+            heuristic_cache = {}
+        except:
+            # Fallback if coordinates aren't available
+            def heuristic(u, v): return 0
+            
+        def get_heuristic(node):
+            if node in heuristic_cache:
+                return heuristic_cache[node]
+            try:
+                node_coords = eval(node)
+                h = sqrt((node_coords[0]-end_coords[0])**2 + (node_coords[1]-end_coords[1])**2)
+                heuristic_cache[node] = h
+                return h
+            except:
+                return 0
+        
+        # Priority queue: (f_score, g_score, node)
+        open_set = []
+        heapq.heappush(open_set, (get_heuristic(start), 0, start))
+        
+        # For node n, came_from[n] is the node immediately preceding it on the cheapest path from start
+        came_from = {}
+        
+        # For node n, g_score[n] is the cost of the cheapest path from start to n currently known
+        g_score = {start: 0}
+        
+        while open_set:
+            current_f, current_g, current_node = heapq.heappop(open_set)
+            
+            if current_node == end:
+                # Reconstruct path
+                path = []
+                while current_node in came_from:
+                    path.append(current_node)
+                    current_node = came_from[current_node]
+                path.append(start)
+                path.reverse()
+                exec_time = time.perf_counter() - start_time
+                return path, current_g, exec_time
+                
+            # Skip if we have a better path already
+            if current_g > g_score.get(current_node, float('inf')):
+                continue
+                
+            for neighbor, edge_data in G[current_node].items():
+                if edge_data.get('is_blocked', False):
+                    continue
+                    
+                tentative_g = current_g + edge_data['weight']
+                
+                if tentative_g < g_score.get(neighbor, float('inf')):
+                    came_from[neighbor] = current_node
+                    g_score[neighbor] = tentative_g
+                    f_score = tentative_g + get_heuristic(neighbor)
+                    heapq.heappush(open_set, (f_score, tentative_g, neighbor))
+                    
+        # No path found
+        return None, float('inf'), time.perf_counter() - start_time
+        
+    except Exception as e:
+        app.logger.error(f"A* error: {str(e)}")
         return None, float('inf'), time.perf_counter() - start_time
 
 def run_greedy_bfs(G, start, end):
-    """Greedy Best-First Search implementation that respects blocked edges"""
+    """Optimized Greedy Best-First Search with efficient heuristics"""
     start_time = time.perf_counter()
+    
+    if start == end:
+        return [start], 0, time.perf_counter() - start_time
+    
     try:
-        # Create a temporary graph where blocked edges are removed
-        temp_G = nx.DiGraph() if isinstance(G, nx.DiGraph) else nx.Graph()
-        for u, v, d in G.edges(data=True):
-            if not d.get('is_blocked', False):
-                temp_G.add_edge(u, v)
-
-        path = nx.astar_path(temp_G, source=start, target=end, heuristic=heuristic, weight=None)
-        cost = sum(G[u][v]['weight'] for u, v in zip(path[:-1], path[1:])) if path else float('inf')
-        exec_time = time.perf_counter() - start_time
-        return path, cost, exec_time
-    except:
+        # Pre-compute heuristic for end node if possible
+        try:
+            end_coords = eval(end)
+            heuristic_cache = {}
+        except:
+            # Fallback if coordinates aren't available
+            def heuristic(u, v): return 0
+            
+        def get_heuristic(node):
+            if node in heuristic_cache:
+                return heuristic_cache[node]
+            try:
+                node_coords = eval(node)
+                h = sqrt((node_coords[0]-end_coords[0])**2 + (node_coords[1]-end_coords[1])**2)
+                heuristic_cache[node] = h
+                return h
+            except:
+                return 0
+        
+        # Priority queue based on heuristic only
+        open_set = []
+        heapq.heappush(open_set, (get_heuristic(start), start))
+        
+        came_from = {start: None}
+        visited = set()
+        
+        while open_set:
+            _, current_node = heapq.heappop(open_set)
+            
+            if current_node == end:
+                # Reconstruct path
+                path = []
+                while current_node is not None:
+                    path.append(current_node)
+                    current_node = came_from[current_node]
+                path.reverse()
+                
+                # Calculate actual path cost
+                cost = 0
+                for u, v in zip(path[:-1], path[1:]):
+                    cost += G[u][v]['weight']
+                    
+                exec_time = time.perf_counter() - start_time
+                return path, cost, exec_time
+                
+            if current_node in visited:
+                continue
+            visited.add(current_node)
+            
+            for neighbor, edge_data in G[current_node].items():
+                if edge_data.get('is_blocked', False):
+                    continue
+                if neighbor not in came_from:
+                    came_from[neighbor] = current_node
+                    heapq.heappush(open_set, (get_heuristic(neighbor), neighbor))
+                    
+        # No path found
+        return None, float('inf'), time.perf_counter() - start_time
+        
+    except Exception as e:
+        app.logger.error(f"Greedy BFS error: {str(e)}")
         return None, float('inf'), time.perf_counter() - start_time
 
-class AntColony:
-    """Optimized Ant Colony Optimization implementation"""
-    def __init__(self, graph, n_ants=15, n_iterations=100, decay=0.5, alpha=1, beta=3, 
-                 elitist_factor=2, stagnation_limit=10):
+class OptimizedAntColony:
+    """Optimized Ant Colony Optimization with multiple performance improvements"""
+
+    def __init__(self, graph, n_ants=15, n_iterations=100, decay=0.5, alpha=1, beta=3,
+                 elitist_factor=2, stagnation_limit=15, parallel_ants=False):
+        """
+        Initialize the optimized ACO algorithm
+
+        Parameters:
+        - graph: NetworkX graph
+        - n_ants: Number of ants per iteration
+        - n_iterations: Maximum number of iterations
+        - decay: Pheromone decay rate (0-1)
+        - alpha: Importance of pheromone (≥0)
+        - beta: Importance of heuristic (≥0)
+        - elitist_factor: Extra pheromone for best path
+        - stagnation_limit: Stop if no improvement after this many iterations
+        - parallel_ants: Whether to simulate parallel ant exploration (conceptual)
+        """
         # Create a temporary graph without blocked edges
         self.graph = nx.DiGraph() if isinstance(graph, nx.DiGraph) else nx.Graph()
         for u, v, d in graph.edges(data=True):
@@ -248,103 +412,125 @@ class AntColony:
         self.beta = beta
         self.elitist_factor = elitist_factor
         self.stagnation_limit = stagnation_limit
-        
+        self.parallel_ants = parallel_ants
+
         # Initialize pheromones inversely proportional to edge weights
         self.pheromone = {}
+        self.heuristic_cache = {}
         for u, v, d in self.graph.edges(data=True):
             self.pheromone[(u, v)] = 1 / max(0.1, d['weight'])
+            self.heuristic_cache[(u, v)] = (1 / max(0.0001, d['weight'])) ** self.beta
             if not isinstance(self.graph, nx.DiGraph):
                 self.pheromone[(v, u)] = self.pheromone[(u, v)]
+                self.heuristic_cache[(v, u)] = self.heuristic_cache[(u, v)]
+
+        # Initialize best path tracking
+        self.best_path = None
+        self.best_cost = float('inf')
+        self.stagnation_count = 0
+        self.iteration_stats = []
 
     def run(self, start, end):
-        start_time = time.perf_counter()
-        best_path = None
-        best_cost = float('inf')
-        stagnation_count = 0
-        iteration_stats = []
+        """Run the optimized ACO algorithm"""
+        start_time = time.time()
 
         for iteration in range(self.n_iterations):
-            paths = []
-            costs = []
-            
-            # Generate paths for all ants
-            for _ in range(self.n_ants):
-                path = self._construct_path(start, end)
-                if path and path[-1] == end:
-                    cost = sum(self.graph[u][v]['weight'] for u, v in zip(path[:-1], path[1:]))
-                    paths.append(path)
-                    costs.append(cost)
-                    
-                    if cost < best_cost:
-                        best_path = path
-                        best_cost = cost
-                        stagnation_count = 0
-                    else:
-                        stagnation_count += 1
+            # Generate solutions from all ants
+            if self.parallel_ants:
+                paths, costs = self._parallel_ant_exploration(start, end)
+            else:
+                paths, costs = self._sequential_ant_exploration(start, end)
 
-            # Early termination if no improvement
-            if stagnation_count >= self.stagnation_limit:
+            # Update best solution
+            self._update_best_solution(paths, costs)
+
+            # Early termination if stagnating
+            if self.stagnation_count >= self.stagnation_limit:
                 break
 
             # Update pheromones
-            self._update_pheromones(paths, costs, best_path, best_cost)
+            self._update_pheromones(paths, costs)
 
             # Adaptive parameter adjustment
-            if iteration > 0 and iteration % 10 == 0:
-                self._adapt_parameters(iteration_stats)
+            if iteration % 10 == 0:
+                self._adapt_parameters(iteration)
 
-            iteration_stats.append({
-                'iteration': iteration,
-                'best_cost': best_cost,
-                'avg_cost': np.mean(costs) if costs else float('inf')
-            })
+        exec_time = time.time() - start_time
+        return self.best_path, self.best_cost, exec_time
 
-        exec_time = time.perf_counter() - start_time
-        return best_path, best_cost, exec_time
+    def _parallel_ant_exploration(self, start, end):
+        """Simulate parallel ant exploration (conceptual optimization)"""
+        paths = []
+        costs = []
+
+        # Generate paths for all ants (conceptually parallel)
+        for _ in range(self.n_ants):
+            path = self._construct_path(start, end)
+            if path and path[-1] == end:
+                cost = sum(self.graph[u][v]['weight'] for u, v in zip(path[:-1], path[1:]))
+                paths.append(path)
+                costs.append(cost)
+
+        return paths, costs
+
+    def _sequential_ant_exploration(self, start, end):
+        """Traditional sequential ant exploration"""
+        return self._parallel_ant_exploration(start, end)  # Same implementation for now
 
     def _construct_path(self, start, end):
+        """Construct a path for a single ant with optimized probability calculation"""
         path = [start]
         current = start
         visited = set([start])
-        
+
         while current != end:
             neighbors = list(self.graph.neighbors(current))
             unvisited = [n for n in neighbors if n not in visited]
-            
+
             if not unvisited:
                 return None  # Dead end
-            
-            # Calculate probabilities with epsilon to avoid division by zero
-            probs = []
-            total = 0
-            epsilon = 1e-10
-            
-            for neighbor in unvisited:
+
+            # Calculate probabilities using cached values
+            probs = np.zeros(len(unvisited))
+            total = 0.0
+
+            for i, neighbor in enumerate(unvisited):
                 edge = (current, neighbor)
-                pheromone = self.pheromone.get(edge, epsilon) ** self.alpha
-                heuristic = (1 / max(epsilon, self.graph[current][neighbor]['weight'])) ** self.beta
-                prob = pheromone * heuristic
-                probs.append(prob)
-                total += prob
-            
+                pheromone = self.pheromone.get(edge, 1e-10) ** self.alpha
+                heuristic = self.heuristic_cache.get(edge, 1e-10)
+                probs[i] = pheromone * heuristic
+                total += probs[i]
+
             # Normalize probabilities
             if total <= 0:
-                probs = [1/len(unvisited)] * len(unvisited)
+                probs = np.ones(len(unvisited)) / len(unvisited)
             else:
-                probs = [p/total for p in probs]
-            
-            next_node = np.random.choice(unvisited, p=probs)
+                probs /= total
+
+            # Choose next node using numpy's optimized random choice
+            next_node = unvisited[np.random.choice(len(unvisited), p=probs)]
             path.append(next_node)
             visited.add(next_node)
             current = next_node
-        
+
         return path
 
-    def _update_pheromones(self, paths, costs, best_path, best_cost):
-        # Evaporate pheromones
+    def _update_best_solution(self, paths, costs):
+        """Update the best found solution"""
+        if costs and min(costs) < self.best_cost:
+            idx = np.argmin(costs)
+            self.best_path = paths[idx]
+            self.best_cost = costs[idx]
+            self.stagnation_count = 0
+        else:
+            self.stagnation_count += 1
+
+    def _update_pheromones(self, paths, costs):
+        """Update pheromone trails with elitist strategy"""
+        # Evaporate all pheromones
         for edge in self.pheromone:
             self.pheromone[edge] *= self.decay
-        
+
         # Deposit pheromones from all ants
         for path, cost in zip(paths, costs):
             deposit = 1 / max(0.1, cost)
@@ -352,29 +538,27 @@ class AntColony:
                 self.pheromone[(u, v)] += deposit
                 if not isinstance(self.graph, nx.DiGraph):
                     self.pheromone[(v, u)] += deposit
-        
+
         # Elitist strategy - reinforce best path
-        if best_path:
-            elite_deposit = self.elitist_factor / max(0.1, best_cost)
-            for u, v in zip(best_path[:-1], best_path[1:]):
+        if self.best_path and self.best_cost < float('inf'):
+            elite_deposit = self.elitist_factor / max(0.1, self.best_cost)
+            for u, v in zip(self.best_path[:-1], self.best_path[1:]):
                 self.pheromone[(u, v)] += elite_deposit
                 if not isinstance(self.graph, nx.DiGraph):
                     self.pheromone[(v, u)] += elite_deposit
 
-    def _adapt_parameters(self, iteration_stats):
-        """Adapt parameters based on performance"""
-        if len(iteration_stats) < 2:
-            return
-            
-        # If improvements are slowing down, increase exploration
-        last_improvement = iteration_stats[-1]['best_cost'] - iteration_stats[-2]['best_cost']
-        if last_improvement > -0.01:  # Small or no improvement
-            self.alpha = max(0.5, self.alpha * 0.95)  # Reduce pheromone influence
-            self.beta = min(5, self.beta * 1.05)  # Increase heuristic influence
+    def _adapt_parameters(self, iteration):
+        """Adaptively adjust parameters based on performance"""
+        # Gradually shift from exploration to exploitation
+        progress = iteration / self.n_iterations
+        self.alpha = min(2.0, 1.0 + progress)  # Increase pheromone importance
+        self.beta = max(1.0, 3.0 - progress)   # Decrease heuristic importance
+
+        # Adjust decay rate based on solution diversity
+        if self.stagnation_count > self.stagnation_limit / 2:
+            self.decay = max(0.3, self.decay * 0.95)  # More exploration
         else:
-            # Reset to default values if we're making good progress
-            self.alpha = 1
-            self.beta = 3
+            self.decay = min(0.9, self.decay * 1.05)  # More exploitation
 
 # ====================== Evaluation with Data Splitting ======================
 def evaluate_with_splitting(filepath, algorithms, test_size=0.2, n_runs=5):
@@ -455,28 +639,31 @@ def evaluate_with_splitting(filepath, algorithms, test_size=0.2, n_runs=5):
 
 # ====================== Modified evaluate_algorithms to accept custom algorithms ======================
 def evaluate_algorithms(G, start, end, algorithms=None, cost_graph=None):
-    """
-    Evaluate algorithms on a graph, optionally using a different graph for cost calculation
-    """
+    """Optimized algorithm evaluation function"""
     if algorithms is None:
         algorithms = {
             'Dijkstra': run_dijkstra,
             'A*': run_astar,
             'Greedy BFS': run_greedy_bfs,
-            'Ant Colony': lambda G, s, e: AntColony(G, n_ants=20, n_iterations=150).run(s, e)
+            'Ant Colony': lambda G, s, e: OptimizedAntColony(G, n_ants=20, n_iterations=150).run(s, e)
         }
     
     results = []
+    
+    # If cost_graph isn't provided, use the main graph
+    cost_G = cost_graph if cost_graph is not None else G
     
     # Run all algorithms and collect results
     for name, algo in algorithms.items():
         path, cost, exec_time = algo(G, start, end)
         
-        # If a separate cost graph is provided, calculate the actual cost using that
-        actual_cost = cost
-        if cost_graph is not None and path is not None:
+        # Calculate actual cost if path exists
+        actual_cost = float('inf')
+        if path is not None:
             try:
-                actual_cost = sum(cost_graph[u][v]['weight'] for u, v in zip(path[:-1], path[1:]))
+                actual_cost = 0
+                for u, v in zip(path[:-1], path[1:]):
+                    actual_cost += cost_G[u][v]['weight']
             except:
                 actual_cost = float('inf')
         
@@ -674,7 +861,7 @@ def evaluate_with_splits():
             'Dijkstra': run_dijkstra,
             'A*': run_astar,
             'Greedy BFS': run_greedy_bfs,
-            'Ant Colony': lambda G, s, e: AntColony(G, n_ants=20, n_iterations=150).run(s, e)
+            'Ant Colony': lambda G, s, e: OptimizedAntColony(G, n_ants=20, n_iterations=150).run(s, e)
         }
         
         results = evaluate_with_splitting(
